@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "author": "Angel Velasquez",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-v1", "id": "esp", "top": -79.52, "left": -52.8, "attrs": {} },
+    { "type": "chip-gps-neo6m", "id": "gps", "top": 135.42, "left": -50.99, "attrs": {} },
+    {
+      "type": "wokwi-lcd1602",
+      "id": "lcd",
+      "top": -281.6,
+      "left": 92,
+      "attrs": { "pins": "i2c" }
+    },
+    { "type": "wokwi-hc-sr04", "id": "front-sensor", "top": 20.7, "left": 197.5, "attrs": {} },
+    { "type": "wokwi-hc-sr04", "id": "rear-sensor", "top": -132.9, "left": 197.5, "attrs": {} }
+  ],
+  "connections": [
+    [ "esp:TX0", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX0", "$serialMonitor:TX", "", [] ],
+    [ "gps:TX", "esp:RX2", "purple", [ "h28.8", "v-115.2", "h-9.6" ] ],
+    [ "gps:RX", "esp:TX2", "cyan", [ "h38.4", "v-134.4" ] ],
+    [ "gps:GND", "esp:GND.1", "black", [ "h57.6", "v-96" ] ],
+    [ "gps:VCC", "esp:3V3", "red", [ "h76.8", "v-96", "h-9.6" ] ],
+    [ "front-sensor:TRIG", "esp:D4", "orange", [ "v19.2", "h-106", "v-96", "h-48" ] ],
+    [ "front-sensor:ECHO", "esp:D5", "blue", [ "v28.8", "h-125.6", "v-115.2", "h0", "v-19.2" ] ],
+    [
+      "front-sensor:VCC",
+      "esp:3V3",
+      "red",
+      [ "v0", "h-38.4", "v38.4", "h-76.8", "v-76.8", "h-9.6" ]
+    ],
+    [ "front-sensor:GND", "esp:GND.1", "black", [ "v57.6", "h-154.8", "v0", "h0", "v-105.6" ] ],
+    [ "rear-sensor:GND", "esp:GND.1", "black", [ "v9.6", "h-183.6", "v76.8" ] ],
+    [ "rear-sensor:TRIG", "esp:D18", "orange", [ "v38.4", "h-230.31" ] ],
+    [ "rear-sensor:ECHO", "esp:D19", "blue", [ "v0" ] ],
+    [ "rear-sensor:VCC", "esp:3V3", "red", [ "v19.2", "h-144", "v105.6" ] ],
+    [ "lcd:GND", "esp:GND.2", "black", [ "h-230.4", "v19.2" ] ],
+    [ "lcd:VCC", "esp:VIN", "red", [ "h-211.2", "v9.7" ] ],
+    [ "lcd:SDA", "esp:D21", "gold", [ "h-19.2", "v192.2" ] ],
+    [ "lcd:SCL", "esp:D22", "limegreen", [ "h-28.8", "v173.1" ] ]
+  ],
+  "dependencies": {}
+}

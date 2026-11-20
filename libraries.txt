@@ -1,0 +1,11 @@
+# Wokwi Library List
+# See https://docs.wokwi.com/guides/libraries
+
+ArduinoJson
+PubSubClient
+ESP32Servo
+LiquidCrystal I2C
+DHT sensor library
+Adafruit Unified Sensor
+EspSoftwareSerial
+ModestIoT@wokwi:8c6d7d148582c8cc2885f7ebc000d20b3ca0e0cb
