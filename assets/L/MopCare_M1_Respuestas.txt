@@ -1,0 +1,382 @@
+Pregunta 1
+
+Consulta del depósito. En la app móvil Kärcher Home Robots, la vista del MopCare M1 debe mostrar el porcentaje de agua limpia que queda y la hora de la última lectura. En la estación, la primera línea del LCD muestra ese porcentaje y cambia a «Empty» cuando el depósito queda vacío.
+
+Aviso de reposición. La app móvil debe avisar al usuario cuando se agote el agua, para que pueda rellenar el depósito antes de iniciar otro ciclo. Si el agua se acaba durante el enjuague, la app debe indicar que el ciclo se interrumpió y que la dosificación queda bloqueada hasta la reposición.
+
+Estado de la bandeja. La segunda línea del LCD muestra en gramos el peso combinado de la bandeja, el paño y el agua. En la app se propone una tarjeta con ese peso y el estado del ciclo. Mientras la válvula está abierta, debe indicar que deje la bandeja en su sitio. Al cerrarse la válvula, debe indicar si ya puede retirarla y si el ciclo se completó o se interrumpió.
+
+Historial para soporte. Un panel web de escritorio debe permitir buscar por estación y fecha, y distinguir los ciclos completados de los interrumpidos por falta de agua. Cada registro debe mostrar el identificador del ciclo, la fecha y hora, el resultado, el motivo si hubo una interrupción y el peso medido al cierre. Mostrar ese peso junto al objetivo de 800 g permite comprobar cuándo se cerró la válvula. El historial también debe permitir consultar los cambios de modo, la presencia de la bandeja y el estado del depósito.
+
+En el prototipo de Wokwi, el LCD permite consultar los valores en el equipo y el monitor serie permite revisar los eventos de la sesión. La app móvil y el panel de soporte son interfaces propuestas para el producto.
+
+Pregunta 2
+
+sketch.ino
+
+/** @file sketch.ino
+ *  @brief Starts the MopCare M1 prototype.
+ */
+#include <Arduino.h>
+#include "MopCareDevice.h"
+
+static const unsigned long serialBaud = 115200;
+static const unsigned long idleDelayMs = 60000;
+static const char identity[] =
+    "company / Kärcher  /  device / MopCare M1  /  developer / Leonardo Prieto  /  Kärcher team";
+
+void setup() {
+    Serial.begin(serialBaud);
+    Serial.println(identity);
+    static MopCareDevice station;
+    station.begin();
+}
+
+void loop() {
+    vTaskDelay(pdMS_TO_TICKS(idleDelayMs));
+}
+
+
+
+
+MopCareDevice.h
+
+/** @file MopCareDevice.h
+ *  @brief Reads the station sensors and controls the water valve.
+ */
+#pragma once
+
+#include <Arduino.h>
+#include <ModestIoT.h>
+
+/** @brief Reads one HC-SR04 and returns the distance in centimeters. */
+class DistanceSensor {
+private:
+    static const int triggerUs = 10;
+    static const int echoUsPerCm = 58;
+    static const unsigned long timeoutUs = 25000;
+    int trigPin;
+    int echoPin;
+
+public:
+    DistanceSensor(int trig, int echo) : trigPin(trig), echoPin(echo) {}
+
+    void begin() {
+        pinMode(trigPin, OUTPUT);
+        pinMode(echoPin, INPUT);
+        digitalWrite(trigPin, LOW);
+    }
+
+    int readCm() {
+        digitalWrite(trigPin, HIGH);
+        delayMicroseconds(triggerUs);
+        digitalWrite(trigPin, LOW);
+        unsigned long pulse = pulseIn(echoPin, HIGH, timeoutUs);
+        if (pulse == 0) return -1;
+        return (pulse + echoUsPerCm / 2) / echoUsPerCm;
+    }
+};
+
+/** @brief Reads the Wokwi HX711 and keeps the most recent valid sample. */
+class TrayScale {
+private:
+    static const int bitCount = 24;
+    static const int clockUs = 1;
+    static const unsigned long signBit = 0x800000UL;
+    static const long rawRange = 0x1000000L;
+    static const unsigned long maxSampleAgeMs = 1000;
+    int dataPin;
+    int clockPin;
+    portMUX_TYPE clockLock = portMUX_INITIALIZER_UNLOCKED;
+    unsigned long lastSampleMs = 0;
+    bool hasSample = false;
+    long counts = 0;
+
+public:
+    static const int countsPerKg = 420;
+    static const int gramsPerKg = 1000;
+
+    TrayScale(int data, int clock) : dataPin(data), clockPin(clock) {}
+
+    void begin() {
+        pinMode(dataPin, INPUT);
+        pinMode(clockPin, OUTPUT);
+        digitalWrite(clockPin, LOW);
+    }
+
+    void sample() {
+        if (digitalRead(dataPin) == HIGH) return;
+
+        unsigned long bits = 0;
+        portENTER_CRITICAL(&clockLock);
+        for (int i = 0; i < bitCount; i++) {
+            digitalWrite(clockPin, HIGH);
+            delayMicroseconds(clockUs);
+            digitalWrite(clockPin, LOW);
+            bits = (bits << 1) | digitalRead(dataPin);
+            delayMicroseconds(clockUs);
+        }
+        digitalWrite(clockPin, HIGH);
+        delayMicroseconds(clockUs);
+        digitalWrite(clockPin, LOW);
+        portEXIT_CRITICAL(&clockLock);
+
+        counts = static_cast<long>(bits);
+        if (bits & signBit) counts -= rawRange;
+        if (counts < 0) counts = 0;
+        hasSample = true;
+        lastSampleMs = millis();
+    }
+
+    bool ready() const {
+        return hasSample && millis() - lastSampleMs <= maxSampleAgeMs;
+    }
+
+    long raw() const {
+        return counts;
+    }
+
+    int grams() const {
+        return lroundf(counts * static_cast<float>(gramsPerKg) / countsPerKg);
+    }
+};
+
+/** @brief Runs the station through one periodic ModestIoT event. */
+class MopCareDevice : public Device {
+private:
+    enum Mode { Waiting, Dosing, Ready, Empty, CheckSensors };
+    enum Reservoir { Unknown, HasWater, NoWater };
+    enum Proximity { NoReading, TrayFar, TrayNear };
+
+    static const int reservoirTrigPin = 26;
+    static const int reservoirEchoPin = 27;
+    static const int trayTrigPin = 16;
+    static const int trayEchoPin = 17;
+    static const int scaleDataPin = 32;
+    static const int scaleClockPin = 33;
+    static const int valvePin = 13;
+    static const int lcdAddress = 0x27;
+    static const int lcdColumns = 16;
+    static const int lcdRows = 2;
+    static const int closedAngle = 0;
+    static const int openAngle = 90;
+    static const int fullCm = 5;
+    static const int emptyCm = 35;
+    static const int trayLimitCm = 15;
+    static const int fullPercent = 100;
+    static const int startGrams = 200;
+    static const int goalGrams = 800;
+    static const long startCounts = startGrams * TrayScale::countsPerKg / TrayScale::gramsPerKg;
+    static const long goalCounts = goalGrams * TrayScale::countsPerKg / TrayScale::gramsPerKg;
+    static const unsigned long periodMs = 100;
+    static const int tickEvent = 100;
+    static const int queueSize = 8;
+
+    DistanceSensor reservoirSensor{reservoirTrigPin, reservoirEchoPin};
+    DistanceSensor traySensor{trayTrigPin, trayEchoPin};
+    TrayScale scale{scaleDataPin, scaleClockPin};
+    ServoMotor valve{valvePin, closedAngle, this};
+    CharacterLcdDisplay screen{lcdAddress, lcdColumns, lcdRows, true, this};
+
+    Mode mode = Waiting;
+    Reservoir reservoir = Unknown;
+    Proximity proximity = NoReading;
+    bool readReservoirNext = true;
+    int levelPct = -1;
+    int trayCm = -1;
+    int lastLevel = -2;
+    int lastWeight = -2;
+    unsigned int cycle = 0;
+
+    void setValve(bool open) {
+        valve.setTargetAngleBufferInDegrees(open ? openAngle : closedAngle);
+        valve.handle(valve.DRIVE_TO_BUFFERED_ANGLE_COMMAND);
+    }
+
+    void setMode(Mode next) {
+        if (next == mode) return;
+        static const char* const names[] = {
+            "waiting", "dosing / leave tray in place", "ready / remove tray",
+            "empty / refill tank", "check sensors"
+        };
+        mode = next;
+        Serial.printf("mode / %s\n", names[mode]);
+    }
+
+    void readDistances() {
+        if (readReservoirNext) {
+            int distance = reservoirSensor.readCm();
+            int percent = (emptyCm - distance) * fullPercent / (emptyCm - fullCm);
+            levelPct = distance < 0 ? -1 : constrain(percent, 0, fullPercent);
+            Reservoir next = levelPct < 0 ? Unknown : (levelPct == 0 ? NoWater : HasWater);
+            if (next != reservoir) {
+                static const char* const names[] = {"unknown", "water available", "empty"};
+                reservoir = next;
+                Serial.printf("reservoir / %s / level %d%%\n", names[reservoir], levelPct);
+            }
+        } else {
+            trayCm = traySensor.readCm();
+            Proximity next = trayCm < 0 ? NoReading : (trayCm <= trayLimitCm ? TrayNear : TrayFar);
+            if (next != proximity) {
+                static const char* const names[] = {"unknown", "far", "near"};
+                proximity = next;
+                Serial.printf("tray proximity / %s / distance %d cm\n", names[proximity], trayCm);
+            }
+        }
+        readReservoirNext = !readReservoirNext;
+    }
+
+    void showStatus(int weight) {
+        if (lastLevel == levelPct && lastWeight == weight) return;
+        static const char emptyText[] = "Empty";
+        static const char levelMissing[] = "Level: --";
+        static const char weightMissing[] = "Weight: --";
+        static const char levelFormat[] = "Level: %u%%";
+        static const char weightFormat[] = "Weight: %d g";
+        char top[lcdColumns + 1];
+        char bottom[lcdColumns + 1];
+
+        snprintf(top, sizeof(top), levelFormat, static_cast<unsigned int>(
+                     static_cast<unsigned char>(constrain(levelPct, 0, fullPercent))));
+        snprintf(bottom, sizeof(bottom), weightFormat, weight);
+        screen.setLineBuffer(0, levelPct < 0 ? levelMissing : (levelPct == 0 ? emptyText : top));
+        screen.setLineBuffer(1, weight < 0 ? weightMissing : bottom);
+        screen.handle(screen.UPDATE_TEXT_COMMAND);
+        lastLevel = levelPct;
+        lastWeight = weight;
+    }
+
+    void finishCycle(const char* result, bool freshWeight) {
+        setValve(false);
+        Serial.printf("cycle / %u / %s / %s %d g / level %d%%\n",
+                      cycle, result, freshWeight ? "final weight" : "last valid weight",
+                      scale.grams(), levelPct);
+    }
+
+    void update() {
+        readDistances();
+        scale.sample();
+        bool weightReady = scale.ready();
+        showStatus(weightReady ? scale.grams() : -1);
+
+        if (reservoir == NoWater) {
+            if (mode == Dosing) finishCycle("interrupted / empty tank", weightReady);
+            setMode(Empty);
+            return;
+        }
+        if (reservoir == Unknown || proximity == NoReading || !weightReady) {
+            if (mode == Dosing) finishCycle("interrupted / sensor reading", weightReady);
+            setMode(CheckSensors);
+            return;
+        }
+        if (proximity == TrayFar) {
+            if (mode == Dosing) finishCycle("interrupted / tray removed", weightReady);
+            setMode(Waiting);
+            return;
+        }
+        if (mode == Dosing) {
+            if (scale.raw() >= goalCounts) {
+                finishCycle("completed", true);
+                setMode(Ready);
+            }
+            return;
+        }
+        if (scale.raw() < startCounts) {
+            cycle++;
+            setValve(true);
+            Serial.printf("cycle / %u / started / weight %d g\n", cycle, scale.grams());
+            setMode(Dosing);
+        } else if (mode != Ready) {
+            setMode(Waiting);
+        }
+    }
+
+public:
+    MopCareDevice() : Device(periodMs, 0) {}
+
+    void begin() {
+        reservoirSensor.begin();
+        traySensor.begin();
+        scale.begin();
+        setValve(false);
+        showStatus(-1);
+        Serial.println("mode / waiting");
+        appendSensorToScheduler(static_cast<EventHandler*>(this), tickEvent);
+        initializeAsynchronousEngine(queueSize);
+    }
+
+    void on(Event event) override {
+        if (event.identifier == tickEvent) update();
+    }
+};
+
+
+
+
+diagram.json
+
+{
+  "version": 1,
+  "author": "Leonardo Prieto",
+  "editor": "wokwi",
+  "serialMonitor": { "display": "always" },
+  "parts": [
+    { "type": "board-esp32-devkit-v1", "id": "esp", "top": 32, "left": 4, "attrs": {} },
+    { "type": "wokwi-hc-sr04", "id": "tank", "top": -110, "left": -275, "attrs": { "distance": "5" } },
+    { "type": "wokwi-hc-sr04", "id": "tray", "top": 58, "left": 198, "attrs": { "distance": "30" } },
+    { "type": "wokwi-hx711", "id": "scale", "top": 49, "left": -294, "attrs": { "type": "5kg" } },
+    { "type": "wokwi-servo", "id": "valve", "top": 234, "left": -210, "attrs": {} },
+    { "type": "wokwi-lcd1602", "id": "lcd", "top": -79, "left": 166, "attrs": { "pins": "i2c" } }
+  ],
+  "connections": [
+    ["esp:TX0", "$serialMonitor:RX", "", []],
+    ["esp:RX0", "$serialMonitor:TX", "", []],
+
+    ["tank:TRIG", "esp:D26", "green", ["v19.2", "*", "h-38.4"]],
+    ["tank:ECHO", "esp:D27", "cyan", ["v28.8", "*", "h-28.8"]],
+    ["tank:VCC", "esp:VIN", "red", ["v9.6", "*", "h-76.8"]],
+    ["tank:GND", "esp:GND.2", "black", ["v14.4", "*", "h-57.6"]],
+
+    ["tray:TRIG", "esp:RX2", "orange", ["v19.2", "*", "h48"]],
+    ["tray:ECHO", "esp:TX2", "blue", ["v28.8", "*", "h38.4"]],
+    ["tray:VCC", "esp:VIN", "red", ["v38.4", "*", "h-19.2"]],
+    ["tray:GND", "esp:GND.1", "black", ["v48", "*", "h28.8"]],
+
+    ["scale:DT", "esp:D32", "blue", ["h-9.6", "v-19.2", "*", "h-38.4"]],
+    ["scale:SCK", "esp:D33", "orange", ["h-19.2", "v-28.8", "*", "h-28.8"]],
+    ["scale:VCC", "esp:VIN", "red", ["h-28.8", "*", "h-48"]],
+    ["scale:GND", "esp:GND.2", "black", ["h-38.4", "*", "h-38.4"]],
+
+    ["valve:PWM", "esp:D13", "purple", ["h-9.6", "v-19.2", "*", "h-19.2"]],
+    ["valve:V+", "esp:VIN", "red", ["h-19.2", "v-28.8", "*", "h-28.8"]],
+    ["valve:GND", "esp:GND.2", "black", ["h-28.8", "v-38.4", "*", "h-38.4"]],
+
+    ["lcd:SDA", "esp:D21", "green", ["h-28.8", "*", "h19.2"]],
+    ["lcd:SCL", "esp:D22", "yellow", ["h-38.4", "*", "h28.8"]],
+    ["lcd:VCC", "esp:VIN", "red", ["h-14.4", "v-48", "*", "h-14.4"]],
+    ["lcd:GND", "esp:GND.1", "black", ["h-19.2", "*", "h9.6"]]
+  ],
+  "dependencies": {}
+}
+
+
+
+
+libraries.txt
+
+# Wokwi Library List
+# See https://docs.wokwi.com/guides/libraries
+
+ArduinoJson
+MQTT
+Modest-IoT-Nano-Framework
+
+
+
+Componentes en Wokwi
+
+- ESP32 DevKit v1
+- HC-SR04 Ultrasonic Distance Sensor (dos unidades: depósito y bandeja)
+- HX711 Load Cell Amplifier (tipo 5 kg)
+- Micro Servo
+- LCD 1602 (modo I2C)

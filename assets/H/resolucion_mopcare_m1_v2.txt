@@ -1,0 +1,545 @@
+Para Kärcher MopCare M1, la aplicación móvil Kärcher Home Robots podría mostrar el nivel de agua limpia disponible y el estado de la estación. La pantalla principal tendría un porcentaje de llenado y un aviso cuando el depósito esté vacío, para que el usuario sepa cuándo debe rellenarlo.
+
+La aplicación también permitiría revisar si la bandeja está colocada cerca de la estación y si la dosificación sigue en proceso o ya terminó. Cuando se alcance el peso de 800 g, podría mostrar que la bandeja está lista para retirar. En el dispositivo, la pantalla LCD mostrará el porcentaje de agua y el peso medido; si no hay agua, indicará Empty.
+
+El llenado se realiza automáticamente. Cuando la bandeja está a 15 cm o menos, el peso es menor de 200 g y queda agua, se abre la válvula. Al llegar a los 800 g, se cierra. Si falta agua, se bloquea la válvula y la aplicación podría avisar que es necesario rellenar el depósito.
+
+Para soporte técnico, una interfaz de escritorio permitiría consultar el historial de ciclos, el peso al finalizar, el nivel del depósito y los eventos de proximidad. Así se podría diferenciar una dosificación completada de una interrumpida. En Wokwi estos datos se comprobarán mediante el monitor serial, sin desarrollar la aplicación móvil ni la interfaz web.
+
+
+
+
+
+
+
+sketch.ino
+
+#include <Arduino.h>
+#include "MopCareDevice.h"
+
+static constexpr unsigned long SERIAL_BAUD = 115200;
+
+void setup() {
+    Serial.begin(SERIAL_BAUD);
+    Serial.println("karcher  / mopcare m1");
+    Serial.println("developer / full name");
+
+    static MopCareDevice device;
+    device.begin();
+}
+
+void loop() {
+    vTaskSuspend(nullptr);
+}
+
+
+
+
+
+
+
+
+
+MopCareDevice.h
+
+#pragma once
+
+#include <Arduino.h>
+#include <ModestIoT.h>
+#include <HX711.h>
+
+class MopCareDevice : public Device {
+private:
+    static constexpr int LEVEL_TRIG_PIN = 16;
+    static constexpr int LEVEL_ECHO_PIN = 17;
+    static constexpr int TRAY_TRIG_PIN = 25;
+    static constexpr int TRAY_ECHO_PIN = 26;
+    static constexpr int WEIGHT_DATA_PIN = 18;
+    static constexpr int WEIGHT_CLOCK_PIN = 19;
+    static constexpr int SERVO_PIN = 13;
+    static constexpr int LCD_ADDRESS = 0x27;
+
+    static constexpr int LCD_COLUMNS = 16;
+    static constexpr int LCD_ROWS = 2;
+    static constexpr int CHECK_EVENT = 1001;
+    static constexpr int CLOSED_ANGLE = 0;
+    static constexpr int OPEN_ANGLE = 90;
+
+    static constexpr float FULL_DISTANCE = 5.0f;
+    static constexpr float EMPTY_DISTANCE = 35.0f;
+    static constexpr float NEAR_DISTANCE = 15.0f;
+    static constexpr float MIN_WEIGHT = 200.0f;
+    static constexpr float TARGET_WEIGHT = 800.0f;
+    static constexpr float GRAMS_PER_KG = 1000.0f;
+    static constexpr float RAW_COUNTS_PER_KG = 420.0f;
+    static constexpr float MAX_PERCENT = 100.0f;
+
+    static constexpr unsigned long SAMPLE_TIME = 200;
+
+    enum class Mode { Waiting, Filling, Finished, Empty };
+
+    UltrasonicSensor levelSensor;
+    UltrasonicSensor traySensor;
+    HX711 weightSensor;
+    ServoMotor valveServo;
+    CharacterLcdDisplay screen;
+
+    float waterLevel = 0;
+    float trayDistance = 0;
+    float trayWeight = 0;
+
+    bool levelReady = false;
+    bool trayReady = false;
+    bool weightReady = false;
+    bool trayNear = false;
+    unsigned long lastWeightRead = 0;
+    static constexpr unsigned long WEIGHT_TIMEOUT = 2500;
+    int completedCycles = 0;
+    int abortedCycles = 0;
+
+    Mode currentMode = Mode::Waiting;
+
+    void moveValve(bool open) {
+        if (open) {
+            valveServo.setTargetAngleBufferInDegrees(OPEN_ANGLE);
+        } else {
+            valveServo.setTargetAngleBufferInDegrees(CLOSED_ANGLE);
+        }
+        valveServo.handle(ServoMotor::DRIVE_TO_BUFFERED_ANGLE_COMMAND);
+    }
+
+    void printCycle(const char* result) {
+        Serial.print("cycle / ");
+        Serial.print(result);
+        Serial.print("  weight / ");
+        Serial.print(trayWeight, 0);
+        Serial.print(" g   water / ");
+        Serial.print(waterLevel, 0);
+        Serial.print("%  done / ");
+        Serial.print(completedCycles);
+        Serial.print("  stopped / ");
+        Serial.println(abortedCycles);
+    }
+
+    void changeMode(Mode nextMode) {
+        if (currentMode == nextMode) return;
+        currentMode = nextMode;
+
+        if (currentMode == Mode::Waiting) Serial.println("mode / waiting");
+        if (currentMode == Mode::Filling) Serial.println("mode / filling");
+        if (currentMode == Mode::Finished) Serial.println("mode / tray ready");
+        if (currentMode == Mode::Empty) Serial.println("mode / empty");
+    }
+
+    void showScreen() {
+        char line1[LCD_COLUMNS + 1];
+        char line2[LCD_COLUMNS + 1];
+
+        if (!levelReady) {
+            snprintf(line1, sizeof(line1), "Level: --");
+        } else if (waterLevel <= 0) {
+            snprintf(line1, sizeof(line1), "Empty");
+        } else {
+            snprintf(line1, sizeof(line1), "Water: %.0f%%", waterLevel);
+        }
+
+        if (!weightReady || millis() - lastWeightRead > WEIGHT_TIMEOUT) {
+            snprintf(line2, sizeof(line2), "Weight: --");
+        } else {
+            snprintf(line2, sizeof(line2), "Weight: %.0fg", trayWeight);
+        }
+
+        screen.setLineBuffer(0, line1);
+        screen.setLineBuffer(1, line2);
+        screen.handle(CharacterLcdDisplay::UPDATE_TEXT_COMMAND);
+    }
+
+    void update() {
+        if (weightSensor.is_ready()) {
+            long rawWeight = weightSensor.read();
+            if (rawWeight >= 0) {
+                trayWeight = rawWeight * GRAMS_PER_KG / RAW_COUNTS_PER_KG;
+                weightReady = true;
+                lastWeightRead = millis();
+            }
+        }
+
+        bool levelValid = levelReady;
+        bool trayValid = trayReady;
+        bool weightValid = weightReady && millis() - lastWeightRead <= WEIGHT_TIMEOUT;
+        bool empty = levelValid && waterLevel <= 0;
+        bool nearNow = trayValid && trayDistance <= NEAR_DISTANCE;
+
+        if (trayValid && nearNow != trayNear) {
+            trayNear = nearNow;
+            if (trayNear) Serial.println("tray / near");
+            else Serial.println("tray / removed");
+        }
+
+        if (currentMode == Mode::Filling) {
+            if (!levelValid || empty || !trayValid || !nearNow || !weightValid) {
+                moveValve(false);
+                abortedCycles++;
+                if (empty) printCycle("aborted / no water");
+                else printCycle("aborted / sensor or tray");
+                changeMode(empty ? Mode::Empty : Mode::Waiting);
+            }
+            else if (trayWeight >= TARGET_WEIGHT) {
+                moveValve(false);
+                completedCycles++;
+                printCycle("completed");
+                changeMode(Mode::Finished);
+            }
+        }
+        else if (empty) {
+            changeMode(Mode::Empty);
+        }
+        else if (currentMode == Mode::Empty && levelValid && waterLevel > 0) {
+            changeMode(Mode::Waiting);
+        }
+        else if (currentMode == Mode::Finished && trayValid && !nearNow) {
+            changeMode(Mode::Waiting);
+        }
+        else if (currentMode == Mode::Waiting && levelValid && trayValid &&
+                 weightValid && nearNow && waterLevel > 0 && trayWeight < MIN_WEIGHT) {
+            moveValve(true);
+            changeMode(Mode::Filling);
+        }
+
+        showScreen();
+    }
+
+public:
+    MopCareDevice()
+        : Device(SAMPLE_TIME, 0),
+          levelSensor(LEVEL_TRIG_PIN, LEVEL_ECHO_PIN, this),
+          traySensor(TRAY_TRIG_PIN, TRAY_ECHO_PIN, this),
+          valveServo(SERVO_PIN, CLOSED_ANGLE, this),
+          screen(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS, true, this) {
+    }
+
+    void begin() {
+        weightSensor.begin(WEIGHT_DATA_PIN, WEIGHT_CLOCK_PIN);
+        moveValve(false);
+        showScreen();
+
+        appendSensorToScheduler(&levelSensor, Sensor::MEASURE_DATA_REQUESTED_EVENT_IDENTIFIER);
+        appendSensorToScheduler(&traySensor, Sensor::MEASURE_DATA_REQUESTED_EVENT_IDENTIFIER);
+        appendSensorToScheduler(static_cast<EventHandler*>(this), CHECK_EVENT);
+
+        initializeAsynchronousEngine(10);
+        Serial.println("mode / waiting");
+    }
+
+    void on(Event event) override {
+        if (event.identifier == Sensor::DATA_READ_EVENT_IDENTIFIER) {
+            if (event.sourceId == LEVEL_TRIG_PIN) {
+                float distance = levelSensor.getDistanceInCentimeters();
+                if (distance <= 0) return;
+
+                waterLevel = (EMPTY_DISTANCE - distance) * MAX_PERCENT /
+                             (EMPTY_DISTANCE - FULL_DISTANCE);
+                if (waterLevel > MAX_PERCENT) waterLevel = MAX_PERCENT;
+                if (waterLevel < 0) waterLevel = 0;
+                levelReady = true;
+            }
+            else if (event.sourceId == TRAY_TRIG_PIN) {
+                trayDistance = traySensor.getDistanceInCentimeters();
+                trayReady = trayDistance > 0;
+            }
+        }
+        else if (event.identifier != CHECK_EVENT) {
+            return;
+        }
+
+        update();
+    }
+};
+
+
+
+
+
+
+
+
+
+diagram.json
+
+{
+  "version": 1,
+  "author": "estudiante",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-devkit-c-v4",
+      "id": "esp",
+      "top": 6.7,
+      "left": 84.2,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-hc-sr04",
+      "id": "reservoir",
+      "top": -272.4,
+      "left": -214.8,
+      "attrs": {
+        "distance": "5"
+      }
+    },
+    {
+      "type": "wokwi-hc-sr04",
+      "id": "proximity",
+      "top": 62.1,
+      "left": -290.3,
+      "attrs": {
+        "distance": "35"
+      }
+    },
+    {
+      "type": "wokwi-hx711",
+      "id": "scale",
+      "top": 298.5,
+      "left": -180.7,
+      "attrs": {
+        "type": "5kg"
+      }
+    },
+    {
+      "type": "wokwi-lcd1602",
+      "id": "lcd",
+      "top": -248.3,
+      "left": 353.6,
+      "attrs": {
+        "pins": "i2c"
+      }
+    },
+    {
+      "type": "wokwi-servo",
+      "id": "servo",
+      "top": 132.4,
+      "left": 418.3,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [
+      "esp:TX0",
+      "$serialMonitor:RX",
+      "",
+      []
+    ],
+    [
+      "esp:RX0",
+      "$serialMonitor:TX",
+      "",
+      []
+    ],
+    [
+      "reservoir:VCC",
+      "esp:5V",
+      "red",
+      [
+        "v23.5",
+        "h109.2",
+        "v44.8",
+        "h38.7"
+      ]
+    ],
+    [
+      "reservoir:GND",
+      "esp:GND.1",
+      "black",
+      [
+        "v36",
+        "h145.6",
+        "v70.4"
+      ]
+    ],
+    [
+      "reservoir:TRIG",
+      "esp:16",
+      "green",
+      [
+        "v52.1",
+        "h133.2",
+        "v84.9",
+        "h17.4"
+      ]
+    ],
+    [
+      "reservoir:ECHO",
+      "esp:17",
+      "blue",
+      [
+        "v66.9",
+        "h168.5",
+        "v91.1"
+      ]
+    ],
+    [
+      "proximity:VCC",
+      "esp:5V",
+      "red",
+      [
+        "h76.2",
+        "v-61.8",
+        "h143.1",
+        "v-73"
+      ]
+    ],
+    [
+      "proximity:GND",
+      "esp:GND.1",
+      "black",
+      [
+        "h97.3",
+        "v-30.6",
+        "h119.3"
+      ]
+    ],
+    [
+      "proximity:TRIG",
+      "esp:25",
+      "green",
+      [
+        "h113.1",
+        "v36.7",
+        "h74.4",
+        "v-24.1"
+      ]
+    ],
+    [
+      "proximity:ECHO",
+      "esp:26",
+      "blue",
+      [
+        "h86.9",
+        "v60.1",
+        "h113.8",
+        "v-16.7"
+      ]
+    ],
+    [
+      "scale:VCC",
+      "esp:5V",
+      "red",
+      [
+        "h83.2",
+        "v-92.6",
+        "h109.8",
+        "v-87.3"
+      ]
+    ],
+    [
+      "scale:GND",
+      "esp:GND.1",
+      "black",
+      [
+        "h73.1",
+        "v-70.5",
+        "h129.7",
+        "v-93.2"
+      ]
+    ],
+    [
+      "scale:DT",
+      "esp:18",
+      "green",
+      [
+        "h102.3",
+        "v-96.5",
+        "h93.2",
+        "v-36.7"
+      ]
+    ],
+    [
+      "scale:SCK",
+      "esp:19",
+      "blue",
+      [
+        "h122.1",
+        "v-78.2",
+        "h102.5",
+        "v-29"
+      ]
+    ],
+    [
+      "lcd:VCC",
+      "esp:5V",
+      "red",
+      [
+        "h-65.8",
+        "v161.1",
+        "h-134.7",
+        "v51.3"
+      ]
+    ],
+    [
+      "lcd:GND",
+      "esp:GND.2",
+      "black",
+      [
+        "h-83.4",
+        "v176.3",
+        "h-123.9"
+      ]
+    ],
+    [
+      "lcd:SDA",
+      "esp:21",
+      "gold",
+      [
+        "h-39.2",
+        "v201.6",
+        "h-140.1",
+        "v-26.6"
+      ]
+    ],
+    [
+      "lcd:SCL",
+      "esp:22",
+      "purple",
+      [
+        "h-25.8",
+        "v193.8",
+        "h-168.2",
+        "v-38.3"
+      ]
+    ],
+    [
+      "servo:V+",
+      "esp:5V",
+      "red",
+      [
+        "h-47.1",
+        "v-55.6",
+        "h-137.6",
+        "v-62.3"
+      ]
+    ],
+    [
+      "servo:GND",
+      "esp:GND.2",
+      "black",
+      [
+        "h-35.2",
+        "v45.9",
+        "h-183.4",
+        "v-58.4"
+      ]
+    ],
+    [
+      "servo:PWM",
+      "esp:13",
+      "green",
+      [
+        "h-68.5",
+        "v19.4",
+        "h-120.6",
+        "v-17.1"
+      ]
+    ]
+  ],
+  "dependencies": {}
+}
